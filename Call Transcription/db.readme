@@ -1,0 +1,222 @@
+Amptalk Call Transcription - DB Schema (LLD)
+
+This schema is designed for the flow:
+Call -> Recording -> Transcription -> Analysis -> Insights -> CRM Sync
+
+Assumption: PostgreSQL (relational core + JSONB for model outputs/metadata).
+
+------------------------------------------------------------
+1) Core Tables
+------------------------------------------------------------
+
+1. tenants
+- id (uuid, pk)
+- name (varchar, not null)
+- created_at (timestamptz, not null, default now())
+
+Reason:
+- Supports multi-tenant isolation from day 1.
+
+2. users
+- id (uuid, pk)
+- tenant_id (uuid, fk -> tenants.id, not null)
+- name (varchar, not null)
+- email (varchar, not null)
+- role (varchar, not null) -- sales_rep | manager | admin
+- created_at (timestamptz, not null, default now())
+- unique(tenant_id, email)
+
+3. calls
+- id (uuid, pk)
+- tenant_id (uuid, fk -> tenants.id, not null)
+- external_meeting_id (varchar, null) -- Zoom/Meet call id
+- start_time (timestamptz, not null)
+- end_time (timestamptz, null)
+- status (varchar, not null) -- scheduled | live | completed | failed
+- crm_account_id (varchar, null)
+- created_by (uuid, fk -> users.id, null)
+- created_at (timestamptz, not null, default now())
+- updated_at (timestamptz, not null, default now())
+- index(tenant_id, start_time desc)
+
+4. call_participants
+- id (uuid, pk)
+- call_id (uuid, fk -> calls.id, not null)
+- user_id (uuid, fk -> users.id, null) -- nullable for external customer
+- display_name (varchar, not null)
+- participant_role (varchar, not null) -- sales | customer
+- joined_at (timestamptz, null)
+- left_at (timestamptz, null)
+- unique(call_id, display_name, participant_role)
+- index(call_id)
+
+5. recordings
+- id (uuid, pk)
+- call_id (uuid, fk -> calls.id, not null)
+- storage_url (text, not null)
+- duration_seconds (int, not null)
+- codec (varchar, null)
+- status (varchar, not null) -- uploaded | processing | ready | failed
+- uploaded_at (timestamptz, not null, default now())
+- processed_at (timestamptz, null)
+- stt_provider (varchar, null)
+- provider_job_id (varchar, null)
+- error_message (text, null)
+- index(call_id, uploaded_at)
+- index(status, uploaded_at)
+
+6. transcripts
+- id (uuid, pk)
+- recording_id (uuid, fk -> recordings.id, not null, unique)
+- language_code (varchar, default 'en')
+- raw_text (text, null)
+- confidence_avg (numeric(5,4), null)
+- created_at (timestamptz, not null, default now())
+- updated_at (timestamptz, not null, default now())
+
+7. transcript_segments
+- id (uuid, pk)
+- transcript_id (uuid, fk -> transcripts.id, not null)
+- speaker_label (varchar, not null) -- "sales", "customer", or diarization label
+- start_ms (int, not null)
+- end_ms (int, not null)
+- text (text, not null)
+- confidence (numeric(5,4), null)
+- sentiment_score (numeric(5,4), null)
+- tokens_json (jsonb, null) -- optional word-level details
+- index(transcript_id, start_ms)
+
+8. insights
+- id (uuid, pk)
+- call_id (uuid, fk -> calls.id, not null)
+- transcript_segment_id (uuid, fk -> transcript_segments.id, null)
+- type (varchar, not null) -- question | objection | action_item
+- speaker_label (varchar, not null)
+- text (text, not null)
+- timestamp_ms (int, not null)
+- confidence (numeric(5,4), null)
+- model_version (varchar, null)
+- metadata_json (jsonb, null)
+- created_at (timestamptz, not null, default now())
+- index(call_id, type)
+- index(call_id, timestamp_ms)
+
+9. call_summaries
+- id (uuid, pk)
+- call_id (uuid, fk -> calls.id, not null, unique)
+- summary_text (text, not null)
+- action_items_json (jsonb, null)
+- objections_json (jsonb, null)
+- generated_by (varchar, not null) -- model/provider
+- created_at (timestamptz, not null, default now())
+
+10. crm_sync_logs
+- id (uuid, pk)
+- call_id (uuid, fk -> calls.id, not null)
+- crm_name (varchar, not null) -- salesforce | hubspot
+- payload_json (jsonb, not null)
+- response_code (int, null)
+- response_body (text, null)
+- status (varchar, not null) -- pending | success | failed
+- retried_count (int, not null, default 0)
+- synced_at (timestamptz, null)
+- created_at (timestamptz, not null, default now())
+- index(call_id, created_at desc)
+- index(status, created_at)
+
+------------------------------------------------------------
+2) Async Pipeline + Reliability Tables
+------------------------------------------------------------
+
+11. outbox_events
+- id (uuid, pk)
+- tenant_id (uuid, fk -> tenants.id, not null)
+- aggregate_type (varchar, not null) -- recording | transcript | insight
+- aggregate_id (uuid, not null)
+- event_type (varchar, not null) -- RecordingUploaded | TranscriptReady | InsightsGenerated
+- payload_json (jsonb, not null)
+- status (varchar, not null, default 'pending') -- pending | processing | published | failed
+- retry_count (int, not null, default 0)
+- available_at (timestamptz, not null, default now())
+- created_at (timestamptz, not null, default now())
+- published_at (timestamptz, null)
+- index(status, available_at)
+- unique(event_type, aggregate_id, created_at)
+
+12. idempotency_keys
+- id (uuid, pk)
+- tenant_id (uuid, fk -> tenants.id, not null)
+- idempotency_key (varchar, not null)
+- request_hash (varchar, not null)
+- response_json (jsonb, null)
+- status_code (int, null)
+- created_at (timestamptz, not null, default now())
+- expires_at (timestamptz, not null)
+- unique(tenant_id, idempotency_key)
+- index(expires_at)
+
+------------------------------------------------------------
+3) Suggested DDL (Short Version)
+------------------------------------------------------------
+
+Example:
+
+CREATE TABLE calls (
+  id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  external_meeting_id VARCHAR(255),
+  start_time TIMESTAMPTZ NOT NULL,
+  end_time TIMESTAMPTZ,
+  status VARCHAR(32) NOT NULL,
+  crm_account_id VARCHAR(255),
+  created_by UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_calls_tenant_start_time
+  ON calls (tenant_id, start_time DESC);
+
+CREATE TABLE recordings (
+  id UUID PRIMARY KEY,
+  call_id UUID NOT NULL REFERENCES calls(id),
+  storage_url TEXT NOT NULL,
+  duration_seconds INT NOT NULL CHECK (duration_seconds > 0),
+  status VARCHAR(32) NOT NULL,
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed_at TIMESTAMPTZ,
+  stt_provider VARCHAR(64),
+  provider_job_id VARCHAR(255),
+  error_message TEXT
+);
+
+CREATE INDEX idx_recordings_call_uploaded
+  ON recordings (call_id, uploaded_at);
+
+CREATE INDEX idx_recordings_status_uploaded
+  ON recordings (status, uploaded_at);
+
+------------------------------------------------------------
+4) Mapping with Current LLD Classes
+------------------------------------------------------------
+
+- Call -> calls
+- Participant -> call_participants (and users for internal reps)
+- Recording -> recordings
+- Transcript -> transcripts
+- TranscriptSegment -> transcript_segments
+- Insight -> insights
+- CRMIntegrationService output -> crm_sync_logs
+- Queue events in controller -> outbox_events
+
+------------------------------------------------------------
+5) Notes for Interview Discussion
+------------------------------------------------------------
+
+- Keep normalized tables for queryability (insights by type, timeline views).
+- Keep JSONB only for flexible/AI-specific metadata.
+- Add tenant_id on major tables for isolation + easy sharding later.
+- Add outbox_events for reliable event publishing (no lost events).
+- Add idempotency_keys for safe retries on upload and webhook callbacks.
+- Partition high-volume tables (`transcript_segments`, `insights`, `outbox_events`)
+  by month or by tenant at scale.
